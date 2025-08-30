@@ -12,7 +12,30 @@ from transformers import pipeline
 # ------------------ Setup ------------------
 load_dotenv()
 LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "google/flan-t5-large")
+APP_USERNAME = os.getenv("APP_USERNAME", "admin")  # set in .env
+APP_PASSWORD = os.getenv("APP_PASSWORD", "password")  # set in .env
+
 st.set_page_config(page_title="StudyMate-LearnHub", page_icon="📘", layout="wide")
+
+# ------------------ Authentication ------------------
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+def login():
+    st.title("🔐 Login to StudyMate-LearnHub")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        if username == APP_USERNAME and password == APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.success("✅ Login successful!")
+            st.rerun()
+        else:
+            st.error("❌ Invalid username or password")
+
+if not st.session_state.authenticated:
+    login()
+    st.stop()
 
 # ------------------ Theme / Styles ------------------
 st.markdown(
@@ -71,31 +94,6 @@ st.markdown(
     .context-box {
         background:#e3f2fd; padding:12px; border-radius:10px;
         border-left:4px solid #42a5f5; margin-bottom:8px; font-size:0.95em;
-    }
-
-    .stApp::before, .stApp::after {
-        content:"";
-        position: fixed; z-index: -1; opacity: 0.15;
-        background-repeat: no-repeat;
-        background-size: 120px, 140px, 160px;
-        pointer-events: none;
-    }
-    .stApp::before {
-        top: 8%; left: 3%;
-        width: 0; height: 0;
-        background-image:
-            url("https://cdn-icons-png.flaticon.com/512/3135/3135755.png"),
-            url("https://cdn-icons-png.flaticon.com/512/29/29302.png"),
-            url("https://cdn-icons-png.flaticon.com/512/1161/1161388.png");
-    }
-    .stApp::after {
-        bottom: 6%; right: 3%;
-        width: 0; height: 0;
-        background-image:
-            url("https://cdn-icons-png.flaticon.com/512/2910/2910768.png"),
-            url("https://cdn-icons-png.flaticon.com/512/1053/1053244.png"),
-            url("https://cdn-icons-png.flaticon.com/512/1828/1828884.png");
-        background-size: 110px, 110px, 130px;
     }
     </style>
     """,
@@ -159,7 +157,7 @@ task, generator = get_generator(LOCAL_MODEL_NAME)
 # ------------------ Session State ------------------
 if "documents" not in st.session_state: st.session_state.documents = []
 if "index" not in st.session_state:     st.session_state.index = None
-if "chat_history" not in st.session_state: st.session_state.chat_history = []  # NEW
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
 
 # ------------------ Sidebar: Chat History ------------------
 with st.sidebar:
@@ -167,7 +165,10 @@ with st.sidebar:
     if st.session_state.chat_history:
         for i, qa in enumerate(st.session_state.chat_history[-5:][::-1], start=1):
             st.markdown(f"**Q{i}:** {qa['question']}")
-            st.caption(f"A: {qa['answer'][:80]}...")  # preview
+            if "simplified" in qa:
+                st.caption(f"Simplified: {qa['simplified'][:80]}...")
+            else:
+                st.caption(f"A: {qa['answer'][:80]}...")
     else:
         st.caption("No questions yet.")
 
@@ -202,24 +203,37 @@ def retrieve_top_k(question: str, k: int = 3):
     D, I = st.session_state.index.search(q_emb.astype(np.float32), k)
     return [st.session_state.documents[i] for i in I[0]]
 
-def generate_answer(context_chunks, question):
+# ------------------ Dual Answer Generator ------------------
+def generate_dual_answers(context_chunks, question):
     context = "\n".join(c["text"] for c in context_chunks)
-    sys_prompt = (
-        "You are StudyMate, an academic assistant. "
-        "Answer the question using ONLY the provided context. "
-        "If the answer isn't in the context, say you don't know."
+
+    simplified_prompt = (
+        "You are a friendly tutor. Using ONLY the given context, explain the answer "
+        "in very simple language, like you are teaching a beginner. Avoid jargon.\n\n"
+        f"Context:\n{context}\n\nQuestion: {question}\n\nSimplified Answer:"
     )
-    prompt = f"{sys_prompt}\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+
+    detailed_prompt = (
+        "You are an academic assistant. Using ONLY the given context, provide a "
+        "comprehensive, detailed explanation with clarity and depth. "
+        "Include technical terms if needed.\n\n"
+        f"Context:\n{context}\n\nQuestion: {question}\n\nDetailed Answer:"
+    )
+
     if task == "text2text-generation":
-        out = generator(prompt, max_new_tokens=256, temperature=0.5)
-        return out[0]["generated_text"].strip()
+        simplified_out = generator(simplified_prompt, max_new_tokens=200, temperature=0.5)
+        detailed_out = generator(detailed_prompt, max_new_tokens=400, temperature=0.5)
+        simplified = simplified_out[0]["generated_text"].strip()
+        detailed = detailed_out[0]["generated_text"].strip()
     else:
-        out = generator(prompt, max_new_tokens=300, temperature=0.5, do_sample=True)
-        text = out[0]["generated_text"]
-        return text.split("Answer:")[-1].strip()
+        simplified_out = generator(simplified_prompt, max_new_tokens=250, temperature=0.5, do_sample=True)
+        detailed_out = generator(detailed_prompt, max_new_tokens=500, temperature=0.5, do_sample=True)
+        simplified = simplified_out[0]["generated_text"].split("Simplified Answer:")[-1].strip()
+        detailed = detailed_out[0]["generated_text"].split("Detailed Answer:")[-1].strip()
+
+    return simplified, detailed
 
 # ------------------ Streamlit UI ------------------
-
 # Hero
 st.markdown(
     """
@@ -330,12 +344,15 @@ if st.session_state.index is None:
 else:
     question = st.text_input("Ask a question")
     if question:
-        with st.spinner("Retrieving and generating answer..."):
+        with st.spinner("Retrieving and generating answers..."):
             top_chunks = retrieve_top_k(question, k=3)
-            answer = generate_answer(top_chunks, question)
+            simplified, detailed = generate_dual_answers(top_chunks, question)
 
-        st.subheader("📖 Answer")
-        st.markdown(f"<div class='answer-box'>{answer}</div>", unsafe_allow_html=True)
+        st.subheader("🟢 Simplified Answer")
+        st.markdown(f"<div class='answer-box'>{simplified}</div>", unsafe_allow_html=True)
+
+        st.subheader("🔵 Detailed Answer")
+        st.markdown(f"<div class='answer-box'>{detailed}</div>", unsafe_allow_html=True)
 
         st.subheader("🔎 Referenced Context")
         for i, c in enumerate(top_chunks, start=1):
@@ -344,9 +361,10 @@ else:
                 unsafe_allow_html=True
             )
 
-        # ✅ Save to chat history
         st.session_state.chat_history.append({
             "question": question,
-            "answer": answer,
+            "simplified": simplified,
+            "detailed": detailed,
             "sources": top_chunks
         })
+
