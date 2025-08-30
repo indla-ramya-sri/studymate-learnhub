@@ -1,2 +1,5 @@
 # Ignore environment files
 .env
+APP_USERNAME=admin
+APP_PASSWORD=1234
+
